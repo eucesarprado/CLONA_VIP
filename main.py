@@ -1,78 +1,84 @@
-from telethon import TelegramClient, events
+from telethon.sync import TelegramClient
+from telethon.tl.types import MessageMediaDocument
 import os
-from flask import Flask
-from threading import Thread, Timer
 import re
-import asyncio
+import time
 
-# Flask para manter online no Railway
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot está online!"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-def manter_online():
-    Thread(target=run).start()
-
-manter_online()
-
-# 🔐 Credenciais da API
+# ✅ API credentials
 api_id = int(os.environ.get("API_ID"))
 api_hash = os.environ.get("API_HASH")
 client = TelegramClient("session", api_id, api_hash)
 
-# IDs do grupo de origem e destino
-origens = [-1002368866066]
-destino_id = -1002632937431
+# ✅ Grupos
+origem_id = -1002543844969  # <- grupo de origem
+destino_id = -1002755408126  # <- grupo de destino
 
-grouped_processados = set()
+# ✅ Controle de duplicação
+enviados_file = "ids_enviados.txt"
 
-# Limpar grouped_processados a cada 10 min
-def limpar_grouped():
-    grouped_processados.clear()
-    print("♻️ Limpeza de grouped_processados feita.")
-    Timer(600, limpar_grouped).start()
+def carregar_ids_enviados():
+    if not os.path.exists(enviados_file):
+        return set()
+    with open(enviados_file, "r") as f:
+        return set(map(int, f.read().splitlines()))
 
-limpar_grouped()
+def salvar_ids_enviados(ids):
+    with open(enviados_file, "a") as f:
+        for msg_id in ids:
+            f.write(f"{msg_id}\n")
 
-@client.on(events.NewMessage(chats=origens))
-async def handler(event):
-    try:
-        msg = event.message
-        texto_original = msg.message or ""
+# 🔍 Regex para remover links
+link_regex = r"https?://\S+"
 
-        # Remove links (mas mantém legenda)
-        texto_limpo = re.sub(r'https?://\S+', '', texto_original).strip()
+# 🔁 Começar leitura
+print("🔄 Iniciando varredura completa...")
+ids_enviados = carregar_ids_enviados()
 
+with client:
+    for msg in client.iter_messages(origem_id, reverse=True):
+        if msg.id in ids_enviados:
+            continue
+
+        # 💾 Álbum (grouped_id)
         if msg.grouped_id:
-            if msg.grouped_id in grouped_processados:
-                return
-            grouped_processados.add(msg.grouped_id)
+            grupo_id = msg.grouped_id
+            grupo_msgs = list(client.iter_messages(origem_id, reverse=True, limit=20))
 
-            print("📦 Álbum detectado.")
-            mensagens = await client.get_messages(event.chat_id, limit=20, min_id=msg.id - 10)
-            album = [m for m in mensagens if m.grouped_id == msg.grouped_id]
+            album = [
+                m for m in grupo_msgs
+                if m.grouped_id == grupo_id and m.media and m.id not in ids_enviados
+            ]
             album = list(reversed(album))
-            media_files = [m.media for m in album if m.media]
 
-            if media_files:
-                print(f"🎯 Enviando álbum com {len(media_files)} mídias...")
-                await client.send_file(destino_id, media_files, caption=texto_limpo or None)
-        elif msg.video or msg.photo:
-            print("📸 Mídia única detectada.")
-            await client.send_file(destino_id, msg.media, caption=texto_limpo or None)
+            if not album:
+                continue
+
+            arquivos = [m.media for m in album if m.media]
+            legenda = album[0].message or ""
+            legenda_limpa = re.sub(link_regex, "", legenda).strip()
+
+            try:
+                client.send_file(destino_id, arquivos, caption=legenda_limpa)
+                salvar_ids_enviados([m.id for m in album])
+                print(f"✅ Álbum enviado | IDs {[m.id for m in album]}")
+                time.sleep(2)
+            except Exception as e:
+                print(f"❌ Erro no álbum: {e}")
+
+        # 📹 Mídia única (vídeo isolado)
+        elif msg.video or (isinstance(msg.media, MessageMediaDocument) and msg.file and 'video' in msg.file.mime_type):
+            legenda = msg.message or ""
+            legenda_limpa = re.sub(link_regex, "", legenda).strip()
+
+            try:
+                client.send_file(destino_id, msg.media, caption=legenda_limpa)
+                salvar_ids_enviados([msg.id])
+                print(f"✅ Vídeo enviado: ID {msg.id}")
+                time.sleep(2)
+            except Exception as e:
+                print(f"⚠️ Erro no ID {msg.id}: {e}")
+
         else:
-            print("⚠️ Ignorado.")
-    except Exception as e:
-        print(f"❌ Erro: {e}")
+            print(f"⏭️ Ignorado: ID {msg.id}")
 
-async def main():
-    print("🤖 Bot rodando...")
-    await client.start()
-    await client.run_until_disconnected()
-
-client.loop.run_until_complete(main())
+print("🚀 Fim da varredura.")
